@@ -1,0 +1,127 @@
+#include <linux/module.h>    /* Needed by all modules */
+#include <linux/kernel.h>    /* Needed for KERN_INFO */
+#include <asm/unistd.h>
+#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/kallsyms.h>
+#include <linux/kobject.h>
+#include <linux/list.h>
+#include <linux/proc_fs.h>
+#include <linux/rbtree.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/syscalls.h>
+#include <linux/sysfs.h>
+#include <linux/uaccess.h>
+#include <linux/unistd.h>
+#include <linux/version.h>
+#include <linux/limits.h>
+#include <linux/delay.h>
+#include <linux/usb.h>
+#include <linux/version.h>
+
+MODULE_LICENSE("GPL");
+#define START_ADDRESS 0xffffffff81000000
+#define END_ADDRESS 0xffffffffa2000000
+
+void **sys_call_table;
+
+void **find_syscall_table(void) {
+    void **sctable;
+    void *i = (void *) START_ADDRESS;
+
+    while (i < END_ADDRESS) {
+        sctable = (void **) i;
+
+        if (sctable[__NR_close] == (void *) sys_close) {
+            size_t j;
+            const unsigned int SYS_CALL_NUM = 300;
+            for (j = 0; j < SYS_CALL_NUM; j++) {
+                if (sctable[j] == NULL) {
+                    goto skip;
+                }
+            }
+            return sctable;
+        }
+        skip:;
+        i += sizeof(void *);
+    }
+
+    return NULL;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+
+struct hook {
+    void *original_function;
+    void *modified_function;
+    void **modified_at_address;
+    struct list_head list;
+};
+
+LIST_HEAD(hook_list);
+
+int hook_create(void **modified_at_address, void *modified_function) {
+    struct hook *h = kmalloc(sizeof(struct hook), GFP_KERNEL);
+
+    if (!h) {
+        return 0;
+    }
+
+    h->modified_at_address = modified_at_address;
+    h->modified_function = modified_function;
+    list_add(&h->list, &hook_list);
+
+    do {
+        preempt_disable();
+        write_cr0(read_cr0() & (~ 0x10000));
+    } while (0);
+    h->original_function = xchg(modified_at_address, modified_function);
+    do {
+        preempt_enable();
+        write_cr0(read_cr0() | 0x10000);
+    } while (0);
+
+
+    return 1;
+}
+
+
+void *hook_get_original(void *modified_function) {
+    void *original_function = NULL;
+    struct hook *h;
+
+    list_for_each_entry(h, &hook_list, list)
+    {
+        if (h->modified_function == modified_function) {
+            original_function = h->original_function;
+            break;
+        }
+    }
+    return original_function;
+}
+
+void hook_remove_all(void) {
+    struct hook *h, *tmp;
+
+    list_for_each_entry(h, &hook_list, list)
+    {
+        do {
+            preempt_disable();
+            write_cr0(read_cr0() & (~ 0x10000));
+        } while (0);
+        *h->modified_at_address = h->original_function;
+        do {
+            preempt_enable();
+            write_cr0(read_cr0() | 0x10000);
+        } while (0);
+    }
+
+    msleep(10);
+    list_for_each_entry_safe(h, tmp, &hook_list, list)
+    {
+        list_del(&h->list);
+        kfree(h);
+    }
+}
